@@ -3,7 +3,16 @@ document.addEventListener('DOMContentLoaded', () => {
     const mcuDatabase = {
         nrf9160: { name: "nRF9160 SIAA", regions: { flash_primary: { startAddress: 0x0, size: 0x100000 } }, mcubootPadSize: 0x200 },
         nrf52840: { name: "nRF52840", regions: { flash_primary: { startAddress: 0x0, size: 0x100000 } }, mcubootPadSize: 0x200 },
-        nrf5340: { name: "nRF5340 (App Core)", regions: { flash_primary: { startAddress: 0x0, size: 0x100000 } }, mcubootPadSize: 0x200 },
+        nrf5340: {
+            name: "nRF5340 (Multi-Core)",
+            regions: {
+                flash_primary: { startAddress: 0x0, size: 0x100000 },        // App Core Flash (1MB)
+                sram_primary: { startAddress: 0x20000000, size: 0x80000 },   // App Core SRAM (512KB)
+                flash_primary_net: { startAddress: 0x01000000, size: 0x40000 }, // Net Core Flash (256KB)
+                sram_primary_net: { startAddress: 0x21000000, size: 0x10000 }  // Net Core SRAM (64KB)
+            },
+            mcubootPadSize: 0x200
+        },
         nrf54l15: { name: "nRF54L15 (Example)", regions: { flash_primary: { startAddress: 0x0, size: 0x180000 } }, mcubootPadSize: 0x800 }
     };
     let state = { selectedMcu: 'nrf9160', memoryRegions: {}, items: [], nextId: 0 };
@@ -18,23 +27,32 @@ document.addEventListener('DOMContentLoaded', () => {
         ],
         fota_external: [
             { type: 'partition', name: 'mcuboot', sizeStr: '48K', region: 'flash_primary' },
-            { type: 'group', name: 'mcuboot_primary', region: 'flash_primary', children: [
-                { type: 'partition', name: 'mcuboot_pad' },
-                { type: 'partition', name: 'app', sizeStr: '900K' }
-            ]},
+            {
+                type: 'group', name: 'mcuboot_primary', region: 'flash_primary', children: [
+                    { type: 'partition', name: 'mcuboot_pad' },
+                    { type: 'partition', name: 'app', sizeStr: '900K' }
+                ]
+            },
             { type: 'partition', name: 'mcuboot_secondary', sizeStr: '960K', region: 'external_flash', device: 'MX25R64' },
             { type: 'partition', name: 'storage', sizeStr: '16K', region: 'flash_primary' },
         ],
         nrf5340_multi: [
-            { type: 'group', name: 'mcuboot_primary_app', region: 'flash_primary', children: [
-                { type: 'partition', name: 'mcuboot_pad' },
-                { type: 'partition', name: 'slot_0_app', sizeStr: '440K' }
-            ]},
+            { type: 'partition', name: 'mcuboot', sizeStr: '48K', region: 'flash_primary' },
+            {
+                type: 'group', name: 'mcuboot_primary_app', region: 'flash_primary', children: [
+                    { type: 'partition', name: 'mcuboot_pad' },
+                    { type: 'partition', name: 'slot_0_app', sizeStr: '440K' }
+                ]
+            },
             { type: 'partition', name: 'slot_1_app', sizeStr: '448K', region: 'flash_primary' },
-            { type: 'group', name: 'mcuboot_primary_net', region: 'flash_primary', children: [
-                { type: 'partition', name: 'slot_0_net', sizeStr: '256K' }
-            ]},
-            { type: 'partition', name: 'slot_1_net', sizeStr: '256K', region: 'flash_primary', span:['app'] },
+            {
+                // Partitions for the network core must be in its own flash region.
+                type: 'group', name: 'mcuboot_primary_net', region: 'flash_primary_net', children: [
+                    { type: 'partition', name: 'slot_0_net', sizeStr: '128K' }
+                ]
+            },
+            { type: 'partition', name: 'slot_1_net', sizeStr: '128K', region: 'flash_primary_net' },
+            { type: 'partition', name: 'storage', sizeStr: '16K', region: 'flash_primary' },
         ]
     };
 
@@ -632,9 +650,20 @@ document.addEventListener('DOMContentLoaded', () => {
             mcuSelector.appendChild(option);
         });
 
+        const loadDefaultTemplateForMcu = (mcuKey) => {
+            if (mcuKey === 'nrf5340') {
+                loadTemplate('nrf5340_multi');
+                templateSelector.value = 'nrf5340_multi';
+            } else {
+                loadTemplate('fota');
+                templateSelector.value = 'fota';
+            }
+        };
+
         mcuSelector.addEventListener('change', (e) => {
-            updateMcu(e.target.value);
-            loadTemplate('fota');
+            const mcuKey = e.target.value;
+            updateMcu(mcuKey);
+            loadDefaultTemplateForMcu(mcuKey);
         });
         templateSelector.addEventListener('change', e => loadTemplate(e.target.value));
         copyYamlBtn.addEventListener('click', () => navigator.clipboard.writeText(yamlOutputEl.textContent).then(() => alert('YAML copied!')));
@@ -718,8 +747,9 @@ document.addEventListener('DOMContentLoaded', () => {
             recalculateLayout();
         });
 
+        mcuSelector.value = state.selectedMcu;
         updateMcu(state.selectedMcu);
-        loadTemplate('fota');
+        loadDefaultTemplateForMcu(state.selectedMcu);
     }
 
     // --- 5. START THE APP ---
