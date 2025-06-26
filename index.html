@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>NCS Partition Manager Helper</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
+</head><body>
+    <h1>NCS `pm_static.yml` Generator</h1>
+
+    <div class="container">
+        <!-- Left Column: Controls and Editor -->
+        <div class="editor-pane">
+            <h2>1. Configuration</h2>
+            
+            <div id="mcu-selection-panel" class="config-section">
+                <label for="mcu-selector">Select Target MCU:</label>
+                <select id="mcu-selector"></select>
+            </div>
+
+            <div id="memory-regions-panel" class="config-section">
+                <label>Memory Regions</label>
+                <div id="memory-regions-list"></div>
+                <button id="add-region-btn">Add Custom Memory Region</button>
+            </div>
+
+            <div id="controls-panel" class="config-section">
+                <label for="templates">Load Partition Template:</label>
+                <select id="templates"></select>
+            </div>
+
+            <div id="upload-section" class="config-section">
+                <label for="yaml-upload">Upload `pm_static.yml`:</label>
+                <input type="file" id="yaml-upload" accept=".yml,.yaml">
+            </div>
+
+            <hr>
+            <h2>2. Partitions</h2>
+            <!-- ADD/REMOVE BUTTONS ARE BACK -->
+            <div class="partition-controls">
+                <button id="add-partition-btn">Add Partition</button>
+                <button id="add-group-btn">Add Group</button>
+            </div>
+            <div id="partition-list"></div>
+        </div>
+
+        <!-- Right Column (No changes) -->
+        <div class="output-pane">
+            <h2>3. Graphical Layout</h2>
+            <div id="graphical-view"></div>
+            <hr>
+            <h2>4. Generated `pm_static.yml`</h2>
+            <div class="yaml-output-container">
+                <button id="copy-yaml-btn">Copy to Clipboard</button>
+                <pre><code id="yaml-output"></code></pre>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

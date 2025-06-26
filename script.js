@@ -1,0 +1,727 @@
+document.addEventListener('DOMContentLoaded', () => {
+    // --- 1. DATABASE AND STATE ---
+    const mcuDatabase = {
+        nrf9160: { name: "nRF9160 SIAA", regions: { flash_primary: { startAddress: 0x0, size: 0x100000 } }, mcubootPadSize: 0x200 },
+        nrf52840: { name: "nRF52840", regions: { flash_primary: { startAddress: 0x0, size: 0x100000 } }, mcubootPadSize: 0x200 },
+        nrf5340: { name: "nRF5340 (App Core)", regions: { flash_primary: { startAddress: 0x0, size: 0x100000 } }, mcubootPadSize: 0x200 },
+        nrf54l15: { name: "nRF54L15 (Example)", regions: { flash_primary: { startAddress: 0x0, size: 0x180000 } }, mcubootPadSize: 0x800 }
+    };
+    let state = { selectedMcu: 'nrf9160', memoryRegions: {}, items: [], nextId: 0 };
+    const partitionColors = ['#4e79a7', '#f28e2c', '#e15759', '#76b7b2', '#59a14f', '#edc949', '#af7aa1', '#ff9da7', '#9c755f', '#bab0ab'];
+    const templates = {
+        fota: [
+            { type: 'partition', name: 'mcuboot', sizeStr: '48K', region: 'flash_primary' },
+            { type: 'partition', name: 'mcuboot_pad', region: 'flash_primary' },
+            { type: 'partition', name: 'slot_0', sizeStr: '480K', region: 'flash_primary' },
+            { type: 'partition', name: 'slot_1', sizeStr: '480K', region: 'flash_primary' },
+            { type: 'partition', name: 'storage', sizeStr: '16K', region: 'flash_primary' },
+        ],
+        fota_external: [
+            { type: 'partition', name: 'mcuboot', sizeStr: '48K', region: 'flash_primary' },
+            { type: 'group', name: 'mcuboot_primary', region: 'flash_primary', children: [
+                { type: 'partition', name: 'mcuboot_pad' },
+                { type: 'partition', name: 'app', sizeStr: '900K' }
+            ]},
+            { type: 'partition', name: 'mcuboot_secondary', sizeStr: '960K', region: 'external_flash', device: 'MX25R64' },
+            { type: 'partition', name: 'storage', sizeStr: '16K', region: 'flash_primary' },
+        ],
+        nrf5340_multi: [
+            { type: 'group', name: 'mcuboot_primary_app', region: 'flash_primary', children: [
+                { type: 'partition', name: 'mcuboot_pad' },
+                { type: 'partition', name: 'slot_0_app', sizeStr: '440K' }
+            ]},
+            { type: 'partition', name: 'slot_1_app', sizeStr: '448K', region: 'flash_primary' },
+            { type: 'group', name: 'mcuboot_primary_net', region: 'flash_primary', children: [
+                { type: 'partition', name: 'slot_0_net', sizeStr: '256K' }
+            ]},
+            { type: 'partition', name: 'slot_1_net', sizeStr: '256K', region: 'flash_primary', span:['app'] },
+        ]
+    };
+
+    // --- 2. DOM ELEMENTS ---
+    const mcuSelector = document.getElementById('mcu-selector');
+    const memoryRegionsListEl = document.getElementById('memory-regions-list');
+    const addRegionBtn = document.getElementById('add-region-btn');
+    const partitionListEl = document.getElementById('partition-list');
+    const addPartitionBtn = document.getElementById('add-partition-btn');
+    const addGroupBtn = document.getElementById('add-group-btn');
+    const graphicalViewEl = document.getElementById('graphical-view');
+    const yamlOutputEl = document.getElementById('yaml-output');
+    const copyYamlBtn = document.getElementById('copy-yaml-btn');
+    const templateSelector = document.getElementById('templates');
+    const yamlUploadEl = document.getElementById('yaml-upload');
+
+    // --- 3. HELPER AND LOGIC FUNCTIONS (Using hoisted declarations for stability) ---
+    function findItem(id, items = state.items, parent = null) {
+        for (const item of items) {
+            if (item.id === id) return { item, parent };
+            if (item.children) {
+                const found = findItem(id, item.children, item);
+                if (found) return found;
+            }
+        }
+        return null;
+    }
+    function parseSize(sizeStr) {
+        if (!sizeStr) return 0;
+        const str = sizeStr.toString().trim();
+        const upper = str.toUpperCase();
+
+        // Check for hex format first (e.g., "0x10000")
+        if (upper.startsWith('0X')) {
+            return parseInt(upper, 16);
+        }
+
+        // Fallback to decimal/K/M parsing (e.g., "128K", "1.4M")
+        const value = parseFloat(upper);
+        if (isNaN(value)) return 0;
+        if (upper.includes('M')) return Math.round(value * 1024 * 1024);
+        if (upper.includes('K')) return Math.round(value * 1024);
+        return Math.round(value);
+    }
+    function formatHex(num, pad = 0) {
+        const hex = Number(num || 0).toString(16).toUpperCase();
+        return `0x${hex.padStart(pad, '0')}`;
+    }
+    function formatBytes(bytes) {
+        if (!bytes || bytes === 0) return '0 B';
+        const k = 1024; const sizes = ['B', 'KB', 'MB', 'GB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    }
+
+    function formatSizeForInput(bytes) {
+        if (!bytes || bytes === 0) return '0';
+        const k = 1024;
+        const m = 1024 * 1024;
+        if (bytes % m === 0) { return (bytes / m) + 'M'; }
+        if (bytes % k === 0) { return (bytes / k) + 'K'; }
+        return bytes.toString();
+    }
+
+    function recalculateLayout() {
+        const FLASH_PAGE_SIZE = 4096; // Nordic MCUs use 4KB flash pages
+
+        // Pass 1: Precompute sizes and propagate regions down the tree.
+        function precompute(items, parentRegion = null) {
+            items.forEach(item => {
+                // A child partition inherits its region from its parent group.
+                item.region = item.region || parentRegion;
+                if (item.type === 'group') {
+                    // Recurse first to calculate child sizes.
+                    if (item.children) { precompute(item.children, item.region); }
+                    // A group's size is the sum of its children's sizes.
+                    item.size = (item.children || []).reduce((sum, child) => sum + (child.size || 0), 0);
+                    item.sizeStr = formatBytes(item.size);
+                } else {
+                    // A partition's size is parsed from its string representation.
+                    const parsedSize = parseSize(item.sizeStr);
+
+                    // Partitions in flash_primary should be aligned to 4KB page sizes.
+                    // We exclude mcuboot_pad which has a special, non-aligned size.
+                    if (item.region === 'flash_primary' && item.name !== 'mcuboot_pad' && parsedSize > 0) {
+                        const alignedSize = Math.ceil(parsedSize / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE;
+                        item.size = alignedSize;
+                        // To improve UX, update the string in the input box to reflect the aligned size.
+                        if (item.size !== parsedSize) {
+                            item.sizeStr = formatSizeForInput(item.size);
+                        }
+                    } else {
+                        item.size = parsedSize;
+                    }
+                }
+            });
+        }
+        precompute(state.items);
+
+        // Pass 2: Calculate addresses based on sizes and regions.
+        Object.keys(state.memoryRegions).forEach(regionName => {
+            const region = state.memoryRegions[regionName];
+            if (!region) return;
+            let currentOffset = region.startAddress || 0;
+
+            // Get all items for the current region.
+            const allRegionItems = state.items.filter(item => item.region === regionName);
+
+            // Identify all items that are children of a group within this region.
+            const childIdsInRegion = new Set();
+            allRegionItems.forEach(item => {
+                if (item.type === 'group' && item.children) {
+                    item.children.forEach(child => childIdsInRegion.add(child.id));
+                }
+            });
+
+            // Lay out only the "root" items (those not contained within another group in this region).
+            // This prevents double-counting sizes and addresses for shared partitions.
+            allRegionItems.filter(item => !childIdsInRegion.has(item.id)).forEach(item => {
+                // If the item already has an address defined (e.g., from YAML import), use it.
+                // Otherwise, calculate it based on the current offset.
+                const effectiveAddress = item.address !== undefined ? item.address : currentOffset;
+                item.address = effectiveAddress; // Assign the determined address to the item
+
+                currentOffset = item.address + item.size; // Update currentOffset for the next item
+                // If the item is a group, we must also calculate the addresses for its children.
+                if (item.type === 'group' && item.children) {
+                    let childOffset = item.address;
+                    item.children.forEach(child => {
+                        // THE FIX: Ensure children inherit the parent's region and calculate their address.
+                        child.region = item.region;
+                        child.address = childOffset;
+                        childOffset += child.size;
+                    });
+                }
+            });
+        });
+        renderAll();
+    }
+
+    // Adds a new item (partition or group) to the state. Can be called recursively for groups.
+    function addItem(itemData, parentId = null, recalculate = true) {
+        const newItem = { ...itemData, id: state.nextId++ };
+
+        // Enforce the correct size for mcuboot_pad based on the selected MCU.
+        if (newItem.name === 'mcuboot_pad') {
+            newItem.sizeStr = mcuDatabase[state.selectedMcu].mcubootPadSize.toString();
+        }
+
+        const childrenFromTemplate = newItem.children;
+        if (newItem.type === 'group') {
+            newItem.children = []; // Ensure children array exists for groups.
+        } else {
+            delete newItem.children; // Partitions can't have children.
+        }
+
+        if (parentId === null) {
+            state.items.push(newItem);
+        } else {
+            const result = findItem(parentId);
+            if (result && result.item.type === 'group') {
+                result.item.children = result.item.children || [];
+                result.item.children.push(newItem);
+            }
+        }
+
+        // If the template data had children, add them recursively without recalculating layout yet.
+        if (childrenFromTemplate) {
+            childrenFromTemplate.forEach(childData => addItem(childData, newItem.id, false));
+        }
+
+        if (recalculate) { recalculateLayout(); }
+    }
+    function removeItem(id) {
+        const result = findItem(id);
+        if (!result) return;
+        const list = result.parent ? result.parent.children : state.items;
+        const index = list.findIndex(i => i.id === id);
+        if (index > -1) { list.splice(index, 1); }
+        recalculateLayout();
+    }
+    function updateItem(id, key, value) {
+        const result = findItem(id);
+        if (result) {
+            if (key === 'span') { result.item[key] = value.split(',').map(s => s.trim()).filter(Boolean); }
+            else { result.item[key] = value; }
+
+            // THE CORE FIX: If an item is renamed to mcuboot_pad, immediately fix its size.
+            if (key === 'name' && value === 'mcuboot_pad') {
+                result.item.sizeStr = mcuDatabase[state.selectedMcu].mcubootPadSize.toString();
+            }
+            recalculateLayout();
+        }
+    }
+
+    function addRegion(name, startAddress, size, isDefault = false) {
+        if (state.memoryRegions[name]) { return; }
+        state.memoryRegions[name] = { startAddress, size, isDefault };
+    }
+    function removeRegion(name) {
+        if (state.memoryRegions[name] && !state.memoryRegions[name].isDefault) {
+            delete state.memoryRegions[name];
+            recalculateLayout();
+        }
+    }
+    function updateRegion(name, key, value) {
+        const region = state.memoryRegions[name];
+        if (region) {
+            const newValue = parseSize(value);
+            if (!isNaN(newValue)) { region[key] = newValue; }
+            recalculateLayout();
+        }
+    }
+    function loadTemplate(templateName) {
+        state.items = [];
+        state.nextId = 0;
+        const template = templates[templateName];
+        if (template) {
+            template.forEach(itemData => {
+                // When a template needs a region that doesn't exist (e.g., external_flash), create it.
+                // Non-primary regions should default to a starting address of 0x0.
+                if (itemData.region === 'external_flash' && !state.memoryRegions['external_flash']) {
+                    addRegion('external_flash', 0x0, 0x800000);
+                }
+            });
+            // Add items recursively from the template, but only trigger one final recalculation.
+            template.forEach(itemData => addItem(itemData, null, false));
+        }
+        recalculateLayout(); // Recalculate layout once after all template items are added.
+    }
+    function updateMcu(mcuKey) {
+        state.selectedMcu = mcuKey;
+        const customRegions = {};
+        Object.keys(state.memoryRegions).forEach(name => {
+            if (state.memoryRegions[name] && !state.memoryRegions[name].isDefault) { customRegions[name] = state.memoryRegions[name]; }
+        });
+        state.memoryRegions = {};
+        const defaultRegions = mcuDatabase[mcuKey].regions;
+        Object.keys(defaultRegions).forEach(name => { addRegion(name, defaultRegions[name].startAddress, defaultRegions[name].size, true); });
+        Object.keys(customRegions).forEach(name => { state.memoryRegions[name] = customRegions[name]; });
+        recalculateLayout();
+    }
+    function loadFromParsedYaml(data) {
+        state.items = [];
+        state.nextId = 0;
+        let tempPartitions = {};
+        let hasExternalFlash = false;
+
+        // First pass: Create all partition objects from the flat YAML structure
+        for (const name in data) {
+            const p = data[name];
+            const size = p.size || 0; // js-yaml already parses hex values to numbers.
+
+            tempPartitions[name] = {
+                id: state.nextId++,
+                name: name,
+                address: p.address, // js-yaml already parses hex values to numbers.
+                size: size,
+                sizeStr: formatSizeForInput(size),
+                region: p.region,
+                device: p.device,
+                spanSource: p.span || p.orig_span, // Use span, fallback to orig_span
+                type: 'partition' // Default to partition
+            };
+
+            if (p.region === 'external_flash') {
+                hasExternalFlash = true;
+            }
+        }
+
+        // If external_flash partitions exist but the region doesn't, create it with a starting address of 0x0.
+        if (hasExternalFlash && !state.memoryRegions['external_flash']) {
+            addRegion('external_flash', 0x0, 0x800000); // Add with default values, starting at 0x0
+        }
+
+        // Second pass: Identify groups and build the hierarchy.
+        // All items in tempPartitions are candidates for state.items.
+        // Groups will have their `type` changed and `children` populated with references.
+        for (const name in tempPartitions) {
+            const p = tempPartitions[name];
+            if (p.spanSource && Array.isArray(p.spanSource)) {
+                p.type = 'group';
+                p.children = [];
+                p.spanSource.forEach(childName => {
+                    const child = tempPartitions[childName];
+                    if (child) {
+                        p.children.push(child);
+                    }
+                });
+                delete p.spanSource; // This is now represented by the children array
+            }
+        }
+
+        // Now, state.items should contain ALL unique partitions and groups from the YAML.
+        state.items = Object.values(tempPartitions).sort((a, b) => {
+            if (a.type === 'group' && b.type !== 'group') return 1;
+            if (a.type !== 'group' && b.type === 'group') return -1;
+            return (a.address || 0) - (b.address || 0);
+        });
+        recalculateLayout();
+        alert('Successfully loaded partitions from pm_static.yml!');
+    }
+    function handleFileUpload(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            try { loadFromParsedYaml(jsyaml.load(event.target.result)); }
+            catch (err) { alert(`Failed to parse YAML file: ${err.message}`); }
+        };
+        reader.readAsText(file);
+    }
+
+    // --- Rendering Functions ---
+    function renderAll() {
+        renderMemoryRegionsList();
+        renderPartitionList();
+        renderGraphicalView();
+        renderYaml();
+    }
+    function renderMemoryRegionsList() {
+        memoryRegionsListEl.innerHTML = '';
+        Object.keys(state.memoryRegions).forEach(name => {
+            const region = state.memoryRegions[name];
+            const item = document.createElement('div');
+            item.className = 'region-item';
+            item.innerHTML = `
+            <input type="text" value="${name}" data-name="${name}" data-key="name" title="Region Name" readonly class="item-name">
+            <input type="text" value="${formatHex(region.startAddress)}" data-name="${name}" data-key="startAddress" title="Start Address" class="region-input">
+            <input type="text" value="${formatHex(region.size)}" data-name="${name}" data-key="size" title="Size" class="region-input">
+            <div class="item-actions">
+            <button data-name="${name}" class="remove-region-btn action-btn" style="visibility: ${region.isDefault ? 'hidden' : 'visible'}">X</button>
+            </div>
+            `;
+            memoryRegionsListEl.appendChild(item);
+        });
+    }
+    function renderPartitionList() {
+        partitionListEl.innerHTML = '';
+        const regionOptions = Object.keys(state.memoryRegions).map(name => `<option value="${name}">${name}</option>`).join('');
+        function renderItem(item, isChild) {
+            const isGroup = item.type === 'group';
+            const isPad = item.name === 'mcuboot_pad';
+            const container = document.createElement('div');
+            container.dataset.id = item.id;
+            container.className = isGroup ? 'group-item' : (isChild ? 'child-partition-item' : 'partition-item');
+            const regionSelector = !isChild ? `<select data-id="${item.id}" data-key="region" class="item-input">${regionOptions}</select>` : '<div></div>';
+            const deviceInput = isGroup ? '<div></div>' : `<input type="text" value="${item.device || ''}" data-id="${item.id}" data-key="device" class="item-input" placeholder="Device">`;
+            const spanInput = isGroup ? '<div></div>' : `<input type="text" value="${(item.span || []).join(', ')}" data-id="${item.id}" data-key="span" class="item-input" placeholder="Spanned by">`;
+            const sizeInput = `<input type="text" value="${item.sizeStr || ''}" data-id="${item.id}" data-key="sizeStr" class="item-input" placeholder="Size" ${(isGroup || isPad) ? 'readonly' : ''}>`;
+            container.innerHTML = `
+            <div class="drag-handle" draggable="true">☰</div>
+            <input type="text" value="${item.name || ''}" data-id="${item.id}" data-key="name" placeholder="Name" class="item-input item-name">
+            ${sizeInput}
+            ${regionSelector}
+            ${deviceInput}
+            ${spanInput}
+            <div class="item-actions">
+            ${isGroup ? `<button class="action-btn add-child-btn" data-id="${item.id}" title="Add Partition to Group">+</button>` : ''}
+            <button class="action-btn remove-item-btn" data-id="${item.id}" title="Remove Item">X</button>
+            </div>
+            `;
+            partitionListEl.appendChild(container);
+            if (!isChild) {
+                const regionSelect = container.querySelector(`select[data-key="region"]`);
+                if (regionSelect) regionSelect.value = item.region;
+            }
+            if (item.children) { item.children.forEach(child => renderItem(child, true)); }
+        }
+
+        // To prevent rendering duplicate items in the list (e.g., a partition that is a child of multiple groups),
+        // we first identify all items that are children.
+        const allChildIds = new Set();
+        state.items.forEach(item => {
+            if (item.type === 'group' && item.children) {
+                item.children.forEach(child => allChildIds.add(child.id));
+            }
+        });
+
+        // Then, we only render the "root" items (those not contained within any group).
+        state.items.filter(item => !allChildIds.has(item.id)).forEach(item => renderItem(item, false));
+    }
+    function renderGraphicalView() {
+        graphicalViewEl.innerHTML = '';
+        Object.keys(state.memoryRegions).forEach(regionName => {
+            const region = state.memoryRegions[regionName];
+            if (!region) return;
+
+            const regionEl = document.createElement('div');
+            regionEl.className = 'memory-region';
+
+            // --- Title ---
+            // To correctly calculate used space, we must find all unique partitions in the region and sum their sizes.
+            const regionItems = state.items.filter(p => p.region === regionName); // All items (parents/children) in region
+            const uniquePartitionsInRegion = new Map();
+            function collectUniquePartitions(items) {
+                items.forEach(item => {
+                    if (item.region === regionName) {
+                        if (item.type === 'group') {
+                            if (item.children) collectUniquePartitions(item.children);
+                        } else {
+                            uniquePartitionsInRegion.set(item.id, item);
+                        }
+                    }
+                });
+            }
+            collectUniquePartitions(state.items);
+            const totalItemSize = Array.from(uniquePartitionsInRegion.values()).reduce((sum, p) => sum + (p.size || 0), 0);
+            const isOverflowing = totalItemSize > region.size;
+            const freeSpace = Math.max(0, region.size - totalItemSize);
+            const titleEl = document.createElement('div');
+            titleEl.className = 'memory-region-title';
+            titleEl.innerHTML = `<span>${regionName} (Total: ${formatBytes(region.size)})</span>`;
+            if (isOverflowing) {
+                const overflowAmount = totalItemSize - region.size;
+                titleEl.innerHTML += `<span class="overflow-warning">OVERFLOW: ${formatBytes(overflowAmount)}</span>`;
+            } else {
+                titleEl.innerHTML += `<span>Used: ${formatBytes(totalItemSize)}, Free: ${formatBytes(freeSpace)}</span>`;
+            }
+            regionEl.appendChild(titleEl);
+
+            // --- Vertical Layout Container ---
+            const layoutContainer = document.createElement('div');
+            layoutContainer.className = 'partition-layout-vertical';
+
+            // --- Header Row ---
+            const headerRow = document.createElement('div');
+            headerRow.className = 'partition-row header';
+            headerRow.innerHTML = `
+                <div class="part-name">Name</div>
+                <div class="part-addr">Address Range</div>
+                <div class="part-size">Size</div>
+            `;
+            layoutContainer.appendChild(headerRow);
+
+            // --- Recursive function to render each item as a row ---
+            function renderItemRow(item, isChild, colorIndex) {
+                if (!item.size && item.type !== 'group') return; // Don't render zero-size partitions, but show empty groups
+
+                const row = document.createElement('div');
+                row.className = 'partition-row';
+                if (isChild) row.classList.add('child-row');
+                if (item.type === 'group') row.classList.add('group-row');
+                row.style.borderLeftColor = partitionColors[colorIndex % partitionColors.length];
+
+                // For an inclusive range, the end address is start + size - 1.
+                // This handles the edge case where size is 0.
+                const endAddress = item.address + (item.size > 0 ? item.size - 1 : 0);
+                row.innerHTML = `
+                    <div class="part-name">${item.name}</div>
+                    <div class="part-addr">${formatHex(item.address, 6)} - ${formatHex(endAddress, 6)}</div>
+                    <div class="part-size">${formatBytes(item.size)} (${formatHex(item.size)})</div>
+                `;
+                layoutContainer.appendChild(row);
+
+                if (item.type === 'group' && item.children) {
+                    item.children.forEach((child, childIndex) => {
+                        renderItemRow(child, true, colorIndex + childIndex + 1);
+                    });
+                }
+            }
+
+            // To render the layout correctly, we only iterate over "root" items for this region.
+            // A root item is one that is not a child of another group in this same region.
+            const childIdsInRegion = new Set();
+            regionItems.forEach(item => {
+                if (item.type === 'group' && item.children) {
+                    item.children.forEach(child => childIdsInRegion.add(child.id));
+                }
+            });
+            const rootRegionItems = regionItems.filter(item => !childIdsInRegion.has(item.id));
+
+            // Start the recursive rendering from the root items.
+            rootRegionItems.forEach((item, index) => renderItemRow(item, false, index));
+
+            // --- Unused Space Row ---
+            if (!isOverflowing && freeSpace > 0) {
+                const unusedRow = document.createElement('div');
+                unusedRow.className = 'partition-row unused-row';
+                const startAddr = region.startAddress + totalItemSize;
+                const endAddr = region.startAddress + region.size - 1;
+                unusedRow.innerHTML = `
+                    <div class="part-name">Unused</div>
+                    <div class="part-addr">${formatHex(startAddr, 6)} - ${formatHex(endAddr, 6)}</div>
+                    <div class="part-size">${formatBytes(freeSpace)} (${formatHex(freeSpace)})</div>
+                `;
+                layoutContainer.appendChild(unusedRow);
+            }
+
+            regionEl.appendChild(layoutContainer);
+            graphicalViewEl.appendChild(regionEl);
+        });
+    }
+    function renderYaml() {
+        let yamlString = '';
+        const allUniqueItems = [];
+        const uniqueNames = new Set(); // To track unique partition names added to allUniqueItems
+
+        // Helper to flatten the state.items structure into a list of unique items for YAML output.
+        // Ensures each partition name appears only once, and all groups are included.
+        function collectUniqueItems(items) {
+            items.forEach(item => {
+                // If it's a group, always add it (groups are top-level in YAML).
+                // If it's a partition, only add it if its name hasn't been added yet.
+                if (item.type === 'group' || !uniqueNames.has(item.name)) {
+                    allUniqueItems.push(item);
+                    uniqueNames.add(item.name);
+                }
+
+                // Recursively collect children, but only for groups.
+                if (item.type === 'group' && item.children) {
+                    collectUniqueItems(item.children);
+                }
+            });
+        }
+        collectUniqueItems(state.items);
+
+        // Sort the collected items to match standard pm_static.yml formatting.
+        allUniqueItems.sort((a, b) => {
+            // Primary sort: by region. 'flash_primary' always comes first.
+            const regionOrder = (region) => {
+                if (region === 'flash_primary') return 0;
+                if (region === 'external_flash') return 1;
+                return 2; // Other custom regions
+            };
+            const aRegionOrder = regionOrder(a.region);
+            const bRegionOrder = regionOrder(b.region);
+            if (aRegionOrder !== bRegionOrder) { return aRegionOrder - bRegionOrder; }
+            if (aRegionOrder > 1 && a.region !== b.region) { return a.region.localeCompare(b.region); }
+
+            // Secondary sort: by address.
+            const aAddr = a.address !== undefined ? a.address : Infinity;
+            const bAddr = b.address !== undefined ? b.address : Infinity;
+            if (aAddr !== bAddr) { return aAddr - bAddr; }
+
+            // Tertiary sort (tie-breaker): partitions before groups.
+            if (a.type === 'partition' && b.type === 'group') return -1;
+            if (a.type === 'group' && b.type === 'partition') return 1;
+            return 0;
+        });
+
+        // Generate YAML for each unique item.
+        allUniqueItems.forEach(item => {
+            if (!item.name) return; // Skip items without a name.
+            yamlString += `${item.name}:\n`;
+
+            // All items (partitions and groups) get an address and region.
+            if (item.address !== undefined) {
+                yamlString += `  address: ${formatHex(item.address)}\n`;
+            }
+            if (item.region) {
+                yamlString += `  region: ${item.region}\n`;
+            }
+
+            // All items get a size.
+            if (item.size) {
+                yamlString += `  size: ${formatHex(item.size)}\n`;
+            }
+            if (item.device) {
+                yamlString += `  device: ${item.device}\n`;
+            }
+
+            // The 'span' property has different meanings for groups vs. partitions.
+            if (item.type === 'group') {
+                const childrenNames = (item.children || []).map(c => c.name).filter(Boolean);
+                if (childrenNames.length > 0) {
+                    // Use the group's name for a more descriptive YAML anchor. Sanitize it for YAML syntax.
+                    const anchorId = (item.name || 'group').replace(/[^a-zA-Z0-9_]/g, '_') + '_span_def';
+                    yamlString += `  orig_span: &${anchorId}\n`;
+                    childrenNames.forEach(name => {
+                        yamlString += `  - ${name}\n`;
+                    });
+                    yamlString += `  span: *${anchorId}\n`;
+                }
+            } else if (item.span && item.span.length > 0) { // 'partition' type
+                yamlString += `  span: [${item.span.join(', ')}]\n`;
+            }
+            yamlString += `\n`;
+        });
+        yamlOutputEl.textContent = yamlString.trim();
+    }
+
+    // --- 4. INITIALIZATION ---
+    function init() {
+        Object.keys(templates).forEach(key => {
+            const option = document.createElement('option');
+            option.value = key;
+            option.textContent = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+            templateSelector.appendChild(option);
+        });
+        Object.keys(mcuDatabase).forEach(key => {
+            const option = document.createElement('option');
+            option.value = key;
+            option.textContent = mcuDatabase[key].name;
+            mcuSelector.appendChild(option);
+        });
+
+        mcuSelector.addEventListener('change', (e) => {
+            updateMcu(e.target.value);
+            loadTemplate('fota');
+        });
+        templateSelector.addEventListener('change', e => loadTemplate(e.target.value));
+        copyYamlBtn.addEventListener('click', () => navigator.clipboard.writeText(yamlOutputEl.textContent).then(() => alert('YAML copied!')));
+
+        partitionListEl.addEventListener('click', (e) => {
+            const target = e.target;
+            const id = target.dataset.id ? parseInt(target.dataset.id, 10) : null;
+            if (target.classList.contains('remove-item-btn')) { removeItem(id); }
+            if (target.classList.contains('add-child-btn')) { addItem({ type: 'partition', name: 'new_partition', sizeStr: '16K' }, id); }
+        });
+        partitionListEl.addEventListener('change', (e) => {
+            const target = e.target;
+            if (target.classList.contains('item-input')) {
+                const id = parseInt(target.dataset.id, 10);
+                const key = target.dataset.key;
+                updateItem(id, key, target.value);
+            }
+        });
+
+        yamlUploadEl.addEventListener('change', handleFileUpload);
+        addPartitionBtn.addEventListener('click', () => { addItem({ type: 'partition', name: 'new_partition', sizeStr: '128K', region: Object.keys(state.memoryRegions)[0] }); });
+        addGroupBtn.addEventListener('click', () => { addItem({ type: 'group', name: 'new_group', region: Object.keys(state.memoryRegions)[0], children: [] }); });
+
+        memoryRegionsListEl.addEventListener('click', (e) => {
+            if (e.target.classList.contains('remove-region-btn')) { removeRegion(e.target.dataset.name); }
+        });
+        memoryRegionsListEl.addEventListener('change', (e) => {
+            if (e.target.classList.contains('region-input')) {
+                const name = e.target.dataset.name;
+                if (e.target.dataset.key !== 'name' && name) { updateRegion(name, e.target.dataset.key, e.target.value); }
+            }
+        });
+
+        let draggedItemId = null;
+        partitionListEl.addEventListener('dragstart', (e) => {
+            if (!e.target.classList.contains('drag-handle')) {
+                e.preventDefault();
+                return;
+            }
+            const dragTarget = e.target.closest('[data-id]');
+            if (dragTarget) {
+                draggedItemId = parseInt(dragTarget.dataset.id, 10);
+                e.dataTransfer.setData('text/plain', draggedItemId);
+                setTimeout(() => { dragTarget.classList.add('dragging'); }, 0);
+            }
+        });
+        partitionListEl.addEventListener('dragend', () => {
+            const draggingEl = partitionListEl.querySelector('.dragging');
+            if (draggingEl) draggingEl.classList.remove('dragging');
+            draggedItemId = null;
+        });
+        partitionListEl.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            const dropTarget = e.target.closest('[data-id]');
+            document.querySelectorAll('.drop-target-top, .drop-target-bottom').forEach(el => el.classList.remove('drop-target-top', 'drop-target-bottom'));
+            if (!dropTarget || parseInt(dropTarget.dataset.id, 10) === draggedItemId) return;
+            const rect = dropTarget.getBoundingClientRect();
+            const midpoint = rect.top + rect.height / 2;
+            if (e.clientY < midpoint) { dropTarget.classList.add('drop-target-top'); }
+            else { dropTarget.classList.add('drop-target-bottom'); }
+        });
+        partitionListEl.addEventListener('dragleave', (e) => {
+            if (!e.currentTarget.contains(e.relatedTarget)) {
+                document.querySelectorAll('.drop-target-top, .drop-target-bottom').forEach(el => el.classList.remove('drop-target-top', 'drop-target-bottom'));
+            }
+        });
+        partitionListEl.addEventListener('drop', (e) => {
+            e.preventDefault();
+            const dropTargetEl = document.querySelector('.drop-target-top, .drop-target-bottom');
+            if (!dropTargetEl || !draggedItemId) return;
+            const dropTargetId = parseInt(dropTargetEl.dataset.id, 10);
+            const dropOnTop = dropTargetEl.classList.contains('drop-target-top');
+            dropTargetEl.classList.remove('drop-target-top', 'drop-target-bottom');
+            const dragged = findItem(draggedItemId);
+            const dropTarget = findItem(dropTargetId);
+            if (!dragged || !dropTarget || dragged.item === dropTarget.item || dragged.parent !== dropTarget.parent) return;
+            const list = dragged.parent ? dragged.parent.children : state.items;
+            const [draggedItem] = list.splice(list.findIndex(i => i.id === draggedItemId), 1);
+            const dropIndex = list.findIndex(i => i.id === dropTargetId);
+            list.splice(dropOnTop ? dropIndex : dropIndex + 1, 0, draggedItem);
+            recalculateLayout();
+        });
+
+        updateMcu(state.selectedMcu);
+        loadTemplate('fota');
+    }
+
+    // --- 5. START THE APP ---
+    init();
+});
