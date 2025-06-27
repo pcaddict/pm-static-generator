@@ -117,11 +117,100 @@ document.addEventListener('DOMContentLoaded', () => {
         return bytes.toString();
     }
 
-    function recalculateLayout() {
+    function validateLayout() {
+        // Clear previous errors from all items in the state tree
+        const allItems = [];
+        function collectAllItems(items) {
+            items.forEach(i => {
+                i.errors = []; // Clear old errors
+                allItems.push(i);
+                if (i.children) { collectAllItems(i.children); }
+            });
+        }
+        collectAllItems(state.items);
+
+        // Identify all items that are children of a group. This is needed for both duplicate name and overlap checks.
+        const allChildIds = new Set();
+        allItems.forEach(item => {
+            if (item.type === 'group' && item.children) {
+                item.children.forEach(child => allChildIds.add(child.id));
+            }
+        });
+
+        // Create a map of unique items by name (partitions and groups) for duplicate name check
+        const uniqueItemsByName = new Map();
+        // Only check for duplicate names among top-level items, as only they become top-level YAML keys.
+        // Children within groups do not need unique names globally.
+        allItems.filter(item => !allChildIds.has(item.id)).forEach(item => {
+            if (item.name) { // Ensure the item has a name to check
+                if (uniqueItemsByName.has(item.name)) {
+                    const other = uniqueItemsByName.get(item.name);
+                    const errorMsg = `Error: Duplicate name '${item.name}'. All top-level item names must be unique.`;
+                    if (!item.errors.includes(errorMsg)) item.errors.push(errorMsg);
+                    if (!other.errors.includes(errorMsg)) other.errors.push(errorMsg);
+                } else {
+                    uniqueItemsByName.set(item.name, item);
+                }
+            }
+        });
+
+        // Validate partitions within each memory region
+        Object.keys(state.memoryRegions).forEach(regionName => {
+            const region = state.memoryRegions[regionName];
+            // Only consider "root" items for overlap and bounds checking.
+            // Children of groups are contained within their parent's space and don't independently overlap.
+            const rootItemsInRegion = Array.from(uniqueItemsByName.values())
+                .filter(p => p.region === regionName && p.address !== undefined && !allChildIds.has(p.id));
+            rootItemsInRegion.sort((a, b) => a.address - b.address); // Sort by address for overlap checks
+
+            for (let i = 0; i < rootItemsInRegion.length; i++) {
+                const p = rootItemsInRegion[i];
+                const p_end = p.address + p.size;
+
+                if (p.address < region.startAddress || p_end > (region.startAddress + region.size)) {
+                    p.errors.push(`Error: Item '${p.name}' is outside of '${regionName}' bounds.`);
+                }
+                // Check for overlaps with all subsequent root items
+                for (let j = i + 1; j < rootItemsInRegion.length; j++) {
+                    const next_p = rootItemsInRegion[j];
+
+                    // A simple check since items are sorted by address
+                    if (p_end > next_p.address) {
+                        // It's an overlap. Now check if it's a permissible one.
+                        // A permissible overlap occurs if one item is a group that logically contains the other.
+                        const isPermissible = (container, content) => {
+                            if (container.type !== 'group' || !container.children) return false;
+                            const containerChildrenIds = new Set(container.children.map(c => c.id));
+                            // Case 1: The content item is a direct child of the container group.
+                            if (containerChildrenIds.has(content.id)) return true;
+                            // Case 2: The content item is a group whose children are a subset of the container's children.
+                            if (content.type === 'group' && content.children) {
+                                return content.children.every(child => containerChildrenIds.has(child.id));
+                            }
+                            return false;
+                        };
+
+                        if (isPermissible(p, next_p) || isPermissible(next_p, p)) {
+                            // This is a logical sub-grouping, so we ignore this overlap.
+                            continue;
+                        }
+
+                        // If not a permissible overlap, then it's a real error.
+                        p.errors.push(`Error: Item '${p.name}' overlaps with '${next_p.name}'.`);
+                        next_p.errors.push(`Error: Item '${next_p.name}' overlapped by '${p.name}'.`);
+                    }
+                }
+            }
+        });
+    }
+
+    function recalculateLayout(options = {}) {
+        const { alignSizes = true } = options;
         const FLASH_PAGE_SIZE = 4096; // Nordic MCUs use 4KB flash pages
 
         // Pass 1: Precompute sizes and propagate regions down the tree.
         function precompute(items, parentRegion = null) {
+            // The `alignSizes` flag is available here from the outer scope.
             items.forEach(item => {
                 // A child partition inherits its region from its parent group.
                 item.region = item.region || parentRegion;
@@ -137,7 +226,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
                     // Partitions in flash_primary should be aligned to 4KB page sizes.
                     // We exclude mcuboot_pad which has a special, non-aligned size.
-                    if (item.region === 'flash_primary' && item.name !== 'mcuboot_pad' && parsedSize > 0) {
+                    // This alignment should only happen on user edits, not on file import.
+                    if (alignSizes && item.region === 'flash_primary' && item.name !== 'mcuboot_pad' && parsedSize > 0) {
                         const alignedSize = Math.ceil(parsedSize / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE;
                         item.size = alignedSize;
                         // To improve UX, update the string in the input box to reflect the aligned size.
@@ -157,6 +247,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const region = state.memoryRegions[regionName];
             if (!region) return;
             let currentOffset = region.startAddress || 0;
+            const isFlashRegion = regionName.startsWith('flash_');
 
             // Get all items for the current region.
             const allRegionItems = state.items.filter(item => item.region === regionName);
@@ -172,10 +263,17 @@ document.addEventListener('DOMContentLoaded', () => {
             // Lay out only the "root" items (those not contained within another group in this region).
             // This prevents double-counting sizes and addresses for shared partitions.
             allRegionItems.filter(item => !childIdsInRegion.has(item.id)).forEach(item => {
-                // If the item already has an address defined (e.g., from YAML import), use it.
-                // Otherwise, calculate it based on the current offset.
-                const effectiveAddress = item.address !== undefined ? item.address : currentOffset;
-                item.address = effectiveAddress; // Assign the determined address to the item
+                let effectiveAddress = item.address;
+                if (effectiveAddress === undefined) { // Only auto-place if address is not manually set
+                    let proposedAddress = currentOffset; // Start with the end of the previous item
+                    // For flash regions, align the proposed start address of the partition (unless it's mcuboot_pad)
+                    if (isFlashRegion && item.name !== 'mcuboot_pad') {
+                        proposedAddress = Math.ceil(proposedAddress / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE;
+                    }
+                    effectiveAddress = proposedAddress;
+                }
+
+                item.address = effectiveAddress;
 
                 currentOffset = item.address + item.size; // Update currentOffset for the next item
                 // If the item is a group, we must also calculate the addresses for its children.
@@ -190,7 +288,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             });
         });
-        renderAll();
+        validateLayout();
+        renderAll(); // Render everything with new layout and validation info
     }
 
     // Adds a new item (partition or group) to the state. Can be called recursively for groups.
@@ -239,6 +338,40 @@ document.addEventListener('DOMContentLoaded', () => {
         if (result) {
             if (key === 'span') { result.item[key] = value.split(',').map(s => s.trim()).filter(Boolean); }
             else { result.item[key] = value; }
+
+            // When a size changes, we must "un-pin" subsequent items so their addresses are recalculated.
+            // We do this by deleting their `address` property, so `recalculateLayout` will auto-place them.
+            if (key === 'sizeStr') {
+                // First, find the path from the root to the changed item to identify its top-level ancestor.
+                function findPath(id, items, currentPath) {
+                    for (const item of items) {
+                        const newPath = [...currentPath, item];
+                        if (item.id === id) return newPath;
+                        if (item.children) {
+                            const foundPath = findPath(id, item.children, newPath);
+                            if (foundPath) return foundPath;
+                        }
+                    }
+                    return null;
+                }
+                const itemPath = findPath(id, state.items, []);
+
+                if (itemPath && itemPath.length > 0) {
+                    const topLevelItem = itemPath[0];
+                    const topLevelIndex = state.items.findIndex(i => i.id === topLevelItem.id);
+
+                    if (topLevelIndex > -1) {
+                        // Iterate through all top-level items that come *after* the one that was changed.
+                        for (let i = topLevelIndex + 1; i < state.items.length; i++) {
+                            const subsequentItem = state.items[i];
+                            // Only un-pin items in the same memory region.
+                            if (subsequentItem.region === topLevelItem.region) {
+                                delete subsequentItem.address; // Un-pin the item itself.
+                            }
+                        }
+                    }
+                }
+            }
 
             // THE CORE FIX: If an item is renamed to mcuboot_pad, immediately fix its size.
             if (key === 'name' && value === 'mcuboot_pad') {
@@ -352,7 +485,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (a.type !== 'group' && b.type === 'group') return -1;
             return (a.address || 0) - (b.address || 0);
         });
-        recalculateLayout();
+        recalculateLayout({ alignSizes: false }); // On import, preserve exact sizes from file.
         alert('Successfully loaded partitions from pm_static.yml!');
     }
     function handleFileUpload(e) {
@@ -399,13 +532,24 @@ document.addEventListener('DOMContentLoaded', () => {
             const container = document.createElement('div');
             container.dataset.id = item.id;
             container.className = isGroup ? 'group-item' : (isChild ? 'child-partition-item' : 'partition-item');
+            if (item.errors && item.errors.length > 0) {
+                container.classList.add('has-error');
+            }
+
             const regionSelector = !isChild ? `<select data-id="${item.id}" data-key="region" class="item-input">${regionOptions}</select>` : '<div></div>';
             const deviceInput = isGroup ? '<div></div>' : `<input type="text" value="${item.device || ''}" data-id="${item.id}" data-key="device" class="item-input" placeholder="Device">`;
             const spanInput = isGroup ? '<div></div>' : `<input type="text" value="${(item.span || []).join(', ')}" data-id="${item.id}" data-key="span" class="item-input" placeholder="Spanned by">`;
             const sizeInput = `<input type="text" value="${item.sizeStr || ''}" data-id="${item.id}" data-key="sizeStr" class="item-input" placeholder="Size" ${(isGroup || isPad) ? 'readonly' : ''}>`;
+            const errorIcon = (item.errors && item.errors.length > 0)
+                ? `<span class="item-error-icon" title="${item.errors.join('\n')}">⚠️</span>`
+                : '';
+
             container.innerHTML = `
             <div class="drag-handle" draggable="true">☰</div>
-            <input type="text" value="${item.name || ''}" data-id="${item.id}" data-key="name" placeholder="Name" class="item-input item-name">
+            <div class="item-name-wrapper">
+                <input type="text" value="${item.name || ''}" data-id="${item.id}" data-key="name" placeholder="Name" class="item-input item-name">
+                ${errorIcon}
+            </div>
             ${sizeInput}
             ${regionSelector}
             ${deviceInput}
@@ -445,32 +589,36 @@ document.addEventListener('DOMContentLoaded', () => {
             regionEl.className = 'memory-region';
 
             // --- Title ---
-            // To correctly calculate used space, we must find all unique partitions in the region and sum their sizes.
-            const regionItems = state.items.filter(p => p.region === regionName); // All items (parents/children) in region
-            const uniquePartitionsInRegion = new Map();
-            function collectUniquePartitions(items) {
+            // To correctly calculate used space, we must find the highest address reached by any partition.
+            // This accounts for gaps caused by alignment.
+            let maxAddress = region.startAddress;
+            function findMaxAddress(items) {
                 items.forEach(item => {
+                    // Only consider items within the current region
                     if (item.region === regionName) {
-                        if (item.type === 'group') {
-                            if (item.children) collectUniquePartitions(item.children);
-                        } else {
-                            uniquePartitionsInRegion.set(item.id, item);
+                        if (item.address !== undefined && item.size > 0) {
+                            maxAddress = Math.max(maxAddress, item.address + item.size);
+                        }
+                        // Recurse into children, as they might be in the same region
+                        if (item.children) {
+                            findMaxAddress(item.children);
                         }
                     }
                 });
             }
-            collectUniquePartitions(state.items);
-            const totalItemSize = Array.from(uniquePartitionsInRegion.values()).reduce((sum, p) => sum + (p.size || 0), 0);
-            const isOverflowing = totalItemSize > region.size;
-            const freeSpace = Math.max(0, region.size - totalItemSize);
+            findMaxAddress(state.items); // Search through all items to find ones in this region
+
+            const totalUsedSpace = maxAddress - region.startAddress;
+            const isOverflowing = totalUsedSpace > region.size;
+            const freeSpace = Math.max(0, region.size - totalUsedSpace);
             const titleEl = document.createElement('div');
             titleEl.className = 'memory-region-title';
             titleEl.innerHTML = `<span>${regionName} (Total: ${formatBytes(region.size)})</span>`;
             if (isOverflowing) {
-                const overflowAmount = totalItemSize - region.size;
+                const overflowAmount = totalUsedSpace - region.size;
                 titleEl.innerHTML += `<span class="overflow-warning">OVERFLOW: ${formatBytes(overflowAmount)}</span>`;
             } else {
-                titleEl.innerHTML += `<span>Used: ${formatBytes(totalItemSize)}, Free: ${formatBytes(freeSpace)}</span>`;
+                titleEl.innerHTML += `<span>Used: ${formatBytes(totalUsedSpace)}, Free: ${formatBytes(freeSpace)}</span>`;
             }
             regionEl.appendChild(titleEl);
 
@@ -517,6 +665,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             // To render the layout correctly, we only iterate over "root" items for this region.
             // A root item is one that is not a child of another group in this same region.
+            const regionItems = state.items.filter(p => p.region === regionName);
             const childIdsInRegion = new Set();
             regionItems.forEach(item => {
                 if (item.type === 'group' && item.children) {
@@ -532,7 +681,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!isOverflowing && freeSpace > 0) {
                 const unusedRow = document.createElement('div');
                 unusedRow.className = 'partition-row unused-row';
-                const startAddr = region.startAddress + totalItemSize;
+                const startAddr = maxAddress; // The unused space starts where the last partition ended.
                 const endAddr = region.startAddress + region.size - 1;
                 unusedRow.innerHTML = `
                     <div class="part-name">Unused</div>

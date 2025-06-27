@@ -43,17 +43,22 @@ button {
   border-left-width: 4px;
   position: relative;
 }
+.partition-item.has-error, .group-item.has-error, .child-partition-item.has-error {
+  border-left-color: #d9534f !important; /* Red border for error */
+  background-color: #fdf2f2;
+}
+
 .region-item {
   grid-template-columns: 1.5fr 1fr 1fr auto;
   background-color: #f9f9f9;
 }
 .group-item {
-  grid-template-columns: auto 2fr 1fr 1fr auto; /* Handle, Name, Size, Span, Actions */
+  grid-template-columns: auto 2fr 1fr 1fr auto; /* Handle, Name Wrapper, Size, Span, Actions */
   background-color: #f7f9fc;
   border-left-color: #4e79a7;
 }
 .partition-item {
-  grid-template-columns: auto 2fr 1fr 1fr 1fr 1fr auto; /* Handle, Name, Size, Region, Device, Span, Actions */
+  grid-template-columns: auto 2fr 1fr 1fr 1fr 1fr auto; /* Handle, Name Wrapper, Size, Region, Device, Span, Actions */
   border-left-color: #f28e2c;
 }
 .child-partition-item {
@@ -61,7 +66,15 @@ button {
   grid-template-columns: auto 2fr 1.5fr 1.5fr 1.5fr auto; /* Handle, Name, Size, Device, Span, Actions */
   border-left-color: #76b7b2;
 }
-.item-name { font-weight: bold; }
+.item-name-wrapper { display: flex; align-items: center; }
+.item-name-wrapper .item-name { flex-grow: 1; font-weight: bold; }
+.item-error-icon {
+    color: #d9534f;
+    cursor: help;
+    font-size: 1.2em;
+    padding-left: 5px;
+    user-select: none;
+}
 
 /* Drag Handle Style */
 .drag-handle {
