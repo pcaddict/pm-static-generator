@@ -108,6 +108,11 @@ button {
 }
 .drop-target-top::before { top: -2px; }
 .drop-target-bottom::after { bottom: -2px; }
+.group-item.drop-target-inside {
+  background-color: #d4edda; /* Light green to indicate a valid drop zone */
+  border-color: #28a745;
+  border-style: dashed;
+}
 
 /* --- Graphical View (Vertical Layout) --- */
 .memory-region { border: 1px solid #ccc; margin-bottom: 20px; }

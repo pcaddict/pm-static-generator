@@ -447,6 +447,61 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     /**
+     * Checks if a given item is a descendant of another item in the state tree.
+     * @param {Object} potentialDescendant The item to check.
+     * @param {Object} potentialAncestor The potential ancestor item.
+     * @returns {boolean} True if potentialDescendant is a descendant of potentialAncestor.
+     */
+    function isDescendant(potentialDescendant, potentialAncestor) {
+        if (!potentialAncestor.children || potentialAncestor.children.length === 0) {
+            return false;
+        }
+        for (const child of potentialAncestor.children) {
+            if (child.id === potentialDescendant.id) {
+                return true;
+            }
+            if (isDescendant(potentialDescendant, child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Moves an item in the state tree to a new position relative to a target item.
+     * @param {number} draggedId The ID of the item being moved.
+     * @param {number} targetId The ID of the item that is the drop target.
+     * @param {'before'|'after'|'inside'} position The position relative to the target.
+     */
+    function moveItem(draggedId, targetId, position) {
+        const dragged = findItem(draggedId);
+        const target = findItem(targetId);
+
+        if (!dragged || !target || dragged.item.id === target.item.id) return;
+
+        // Prevent dropping a group into one of its own descendants
+        if (dragged.item.type === 'group' && isDescendant(target.item, dragged.item)) {
+            console.warn("Cannot move a group into one of its own children.");
+            return;
+        }
+
+        // 1. Remove the item from its original location
+        const sourceList = dragged.parent ? dragged.parent.children : state.items;
+        const draggedIndex = sourceList.findIndex(i => i.id === draggedId);
+        const [draggedItem] = sourceList.splice(draggedIndex, 1);
+
+        // 2. Add the item to its new location
+        if (position === 'inside' && target.item.type === 'group') {
+            target.item.children.push(draggedItem);
+        } else {
+            const destList = target.parent ? target.parent.children : state.items;
+            const targetIndex = destList.findIndex(i => i.id === targetId);
+            destList.splice(position === 'before' ? targetIndex : targetIndex + 1, 0, draggedItem);
+        }
+        recalculateLayout();
+    }
+
+    /**
      * Adds a new memory region to the state.
      * @param {string} name The unique name for the region (e.g., 'external_flash').
      * @param {number} startAddress The starting address of the region.
@@ -981,54 +1036,77 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
 
-        let draggedItemId = null;
+        // --- Drag and Drop Logic ---
+        let draggedItemId = null; // ID of the item being dragged
+
         partitionListEl.addEventListener('dragstart', (e) => {
-            if (!e.target.classList.contains('drag-handle')) {
+            // Ensure drag only starts on the handle
+            const dragHandle = e.target.closest('.drag-handle');
+            if (!dragHandle) {
                 e.preventDefault();
                 return;
             }
             const dragTarget = e.target.closest('[data-id]');
             if (dragTarget) {
                 draggedItemId = parseInt(dragTarget.dataset.id, 10);
+                e.dataTransfer.effectAllowed = 'move';
                 e.dataTransfer.setData('text/plain', draggedItemId);
                 setTimeout(() => { dragTarget.classList.add('dragging'); }, 0);
             }
         });
-        partitionListEl.addEventListener('dragend', () => {
+
+        partitionListEl.addEventListener('dragend', (e) => {
             const draggingEl = partitionListEl.querySelector('.dragging');
             if (draggingEl) draggingEl.classList.remove('dragging');
+            // Clean up all indicators if the drag ends unexpectedly
+            document.querySelectorAll('.drop-target-top, .drop-target-bottom, .drop-target-inside').forEach(el => {
+                el.classList.remove('drop-target-top', 'drop-target-bottom', 'drop-target-inside');
+            });
             draggedItemId = null;
         });
+
         partitionListEl.addEventListener('dragover', (e) => {
             e.preventDefault();
-            const dropTarget = e.target.closest('[data-id]');
-            document.querySelectorAll('.drop-target-top, .drop-target-bottom').forEach(el => el.classList.remove('drop-target-top', 'drop-target-bottom'));
-            if (!dropTarget || parseInt(dropTarget.dataset.id, 10) === draggedItemId) return;
-            const rect = dropTarget.getBoundingClientRect();
-            const midpoint = rect.top + rect.height / 2;
-            if (e.clientY < midpoint) { dropTarget.classList.add('drop-target-top'); }
-            else { dropTarget.classList.add('drop-target-bottom'); }
-        });
-        partitionListEl.addEventListener('dragleave', (e) => {
-            if (!e.currentTarget.contains(e.relatedTarget)) {
-                document.querySelectorAll('.drop-target-top, .drop-target-bottom').forEach(el => el.classList.remove('drop-target-top', 'drop-target-bottom'));
+            const dropTargetEl = e.target.closest('[data-id]');
+
+            // Clear previous indicators before setting a new one
+            document.querySelectorAll('.drop-target-top, .drop-target-bottom, .drop-target-inside').forEach(el => {
+                el.classList.remove('drop-target-top', 'drop-target-bottom', 'drop-target-inside');
+            });
+
+            if (!dropTargetEl || !draggedItemId || parseInt(dropTargetEl.dataset.id, 10) === draggedItemId) return;
+
+            const isGroup = dropTargetEl.classList.contains('group-item');
+            const rect = dropTargetEl.getBoundingClientRect();
+            const dropZoneHeight = rect.height * 0.25; // Use 25% of height for top/bottom zones
+
+            if (isGroup && e.clientY > rect.top + dropZoneHeight && e.clientY < rect.bottom - dropZoneHeight) {
+                // Hovering in the middle of a group: drop inside
+                dropTargetEl.classList.add('drop-target-inside');
+            } else if (e.clientY < rect.top + rect.height / 2) {
+                // Hovering on the top half: drop before
+                dropTargetEl.classList.add('drop-target-top');
+            } else {
+                // Hovering on the bottom half: drop after
+                dropTargetEl.classList.add('drop-target-bottom');
             }
         });
+
+        partitionListEl.addEventListener('dragleave', (e) => {
+            // Clear indicators if the cursor leaves the list container entirely
+            if (!e.currentTarget.contains(e.relatedTarget)) {
+                document.querySelectorAll('.drop-target-top, .drop-target-bottom, .drop-target-inside').forEach(el => el.classList.remove('drop-target-top', 'drop-target-bottom', 'drop-target-inside'));
+            }
+        });
+
         partitionListEl.addEventListener('drop', (e) => {
             e.preventDefault();
-            const dropTargetEl = document.querySelector('.drop-target-top, .drop-target-bottom');
-            if (!dropTargetEl || !draggedItemId) return;
-            const dropTargetId = parseInt(dropTargetEl.dataset.id, 10);
-            const dropOnTop = dropTargetEl.classList.contains('drop-target-top');
-            dropTargetEl.classList.remove('drop-target-top', 'drop-target-bottom');
-            const dragged = findItem(draggedItemId);
-            const dropTarget = findItem(dropTargetId);
-            if (!dragged || !dropTarget || dragged.item === dropTarget.item || dragged.parent !== dropTarget.parent) return;
-            const list = dragged.parent ? dragged.parent.children : state.items;
-            const [draggedItem] = list.splice(list.findIndex(i => i.id === draggedItemId), 1);
-            const dropIndex = list.findIndex(i => i.id === dropTargetId);
-            list.splice(dropOnTop ? dropIndex : dropIndex + 1, 0, draggedItem);
-            recalculateLayout();
+            const dropIndicatorEl = document.querySelector('.drop-target-top, .drop-target-bottom, .drop-target-inside');
+            if (!dropIndicatorEl || !draggedItemId) return;
+
+            const dropTargetId = parseInt(dropIndicatorEl.dataset.id, 10);
+            const position = dropIndicatorEl.classList.contains('drop-target-inside') ? 'inside' : (dropIndicatorEl.classList.contains('drop-target-top') ? 'before' : 'after');
+            moveItem(draggedItemId, dropTargetId, position);
         });
 
         mcuSelector.value = state.selectedMcu;
