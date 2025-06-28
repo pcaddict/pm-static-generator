@@ -55,6 +55,10 @@ This tool helps you understand your device's memory layout, avoid common errors 
 *   **Dependencies:**
     *   js-yaml for parsing uploaded YAML files. It is loaded via a CDN.
 
+## Disclaimer
+
+*   This application was developed with the help of Google Gemini. 
+
 ## Contributing
 
 Contributions are welcome! Feel free to open an issue to report a bug or suggest a feature, or create a pull request to add improvements.
