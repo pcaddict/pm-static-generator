@@ -70,6 +70,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const yamlUploadEl = document.getElementById('yaml-upload');
 
     // --- 3. HELPER AND LOGIC FUNCTIONS (Using hoisted declarations for stability) ---
+    /**
+     * Recursively finds an item (and its parent) in the state tree by its ID.
+     * @param {number} id The ID of the item to find.
+     * @param {Array<Object>} [items=state.items] The array of items to search within.
+     * @param {Object|null} [parent=null] The parent of the current items array.
+     * @returns {{item: Object, parent: Object|null}|null} An object containing the found item and its parent, or null if not found.
+     */
     function findItem(id, items = state.items, parent = null) {
         for (const item of items) {
             if (item.id === id) return { item, parent };
@@ -80,6 +87,12 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         return null;
     }
+    /**
+     * Parses a size string (e.g., "48K", "0.5M", "0x10000") into a number of bytes.
+     * Supports K (kilobytes), M (megabytes), and 0x (hexadecimal) notations.
+     * @param {string} sizeStr The string representation of the size.
+     * @returns {number} The size in bytes.
+     */
     function parseSize(sizeStr) {
         if (!sizeStr) return 0;
         const str = sizeStr.toString().trim();
@@ -97,17 +110,33 @@ document.addEventListener('DOMContentLoaded', () => {
         if (upper.includes('K')) return Math.round(value * 1024);
         return Math.round(value);
     }
+    /**
+     * Formats a number as a hexadecimal string with a "0x" prefix.
+     * @param {number} num The number to format.
+     * @param {number} [pad=0] The minimum number of digits for the hex value (pads with leading zeros).
+     * @returns {string} The formatted hexadecimal string (e.g., "0x001000").
+     */
     function formatHex(num, pad = 0) {
         const hex = Number(num || 0).toString(16).toUpperCase();
         return `0x${hex.padStart(pad, '0')}`;
     }
+    /**
+     * Formats a number of bytes into a human-readable string (e.g., "128 KB", "1.5 MB").
+     * @param {number} bytes The number of bytes.
+     * @returns {string} The human-readable size string.
+     */
     function formatBytes(bytes) {
         if (!bytes || bytes === 0) return '0 B';
         const k = 1024; const sizes = ['B', 'KB', 'MB', 'GB'];
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
     }
-
+    /**
+     * Formats a number of bytes into a string suitable for the size input field (e.g., "48K", "1M").
+     * Prefers K or M notation if the number is an exact multiple.
+     * @param {number} bytes The number of bytes.
+     * @returns {string} The formatted size string for input fields.
+     */
     function formatSizeForInput(bytes) {
         if (!bytes || bytes === 0) return '0';
         const k = 1024;
@@ -117,6 +146,14 @@ document.addEventListener('DOMContentLoaded', () => {
         return bytes.toString();
     }
 
+    /**
+     * Validates the current partition layout.
+     * Checks for:
+     * 1. Duplicate top-level partition/group names.
+     * 2. Partitions that are outside the bounds of their memory region.
+     * 3. Overlapping partitions.
+     * Errors are stored in the `errors` array of each affected item.
+     */
     function validateLayout() {
         // Clear previous errors from all items in the state tree
         const allItems = [];
@@ -204,6 +241,16 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    /**
+     * Recalculates the size and address of every item in the state.
+     * This is the core logic function that determines the memory map.
+     * It runs in two passes:
+     * 1. Precomputes sizes, propagating regions down to children and optionally aligning flash partitions.
+     * 2. Calculates addresses, laying out items sequentially within each region.
+     * After calculating, it triggers validation and a full re-render.
+     * @param {Object} [options={}] - Configuration options for the recalculation.
+     * @param {boolean} [options.alignSizes=true] - Whether to align partition sizes in flash to the page size.
+     */
     function recalculateLayout(options = {}) {
         const { alignSizes = true } = options;
         const FLASH_PAGE_SIZE = 4096; // Nordic MCUs use 4KB flash pages
@@ -292,7 +339,12 @@ document.addEventListener('DOMContentLoaded', () => {
         renderAll(); // Render everything with new layout and validation info
     }
 
-    // Adds a new item (partition or group) to the state. Can be called recursively for groups.
+    /**
+     * Adds a new item (partition or group) to the state. Can be called recursively for groups.
+     * @param {Object} itemData The data for the new item (e.g., { type, name, sizeStr }).
+     * @param {number|null} [parentId=null] The ID of the parent group to add this item to. If null, adds to the root.
+     * @param {boolean} [recalculate=true] Whether to trigger a layout recalculation after adding.
+     */
     function addItem(itemData, parentId = null, recalculate = true) {
         const newItem = { ...itemData, id: state.nextId++ };
 
@@ -325,6 +377,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (recalculate) { recalculateLayout(); }
     }
+    /**
+     * Removes an item (and its children, if it's a group) from the state by its ID.
+     * @param {number} id The ID of the item to remove.
+     */
     function removeItem(id) {
         const result = findItem(id);
         if (!result) return;
@@ -333,6 +389,15 @@ document.addEventListener('DOMContentLoaded', () => {
         if (index > -1) { list.splice(index, 1); }
         recalculateLayout();
     }
+    /**
+     * Updates a property of an item in the state.
+     * Triggers a layout recalculation after the update.
+     * Special logic handles un-pinning subsequent items when a size changes,
+     * and auto-updating size when an item is renamed to 'mcuboot_pad'.
+     * @param {number} id The ID of the item to update.
+     * @param {string} key The property key to update (e.g., 'name', 'sizeStr').
+     * @param {string|any} value The new value for the property.
+     */
     function updateItem(id, key, value) {
         const result = findItem(id);
         if (result) {
@@ -381,16 +446,33 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    /**
+     * Adds a new memory region to the state.
+     * @param {string} name The unique name for the region (e.g., 'external_flash').
+     * @param {number} startAddress The starting address of the region.
+     * @param {number} size The total size of the region in bytes.
+     * @param {boolean} [isDefault=false] Whether this is a default region for the MCU (cannot be deleted).
+     */
     function addRegion(name, startAddress, size, isDefault = false) {
         if (state.memoryRegions[name]) { return; }
         state.memoryRegions[name] = { startAddress, size, isDefault };
     }
+    /**
+     * Removes a custom (non-default) memory region from the state.
+     * @param {string} name The name of the region to remove.
+     */
     function removeRegion(name) {
         if (state.memoryRegions[name] && !state.memoryRegions[name].isDefault) {
             delete state.memoryRegions[name];
             recalculateLayout();
         }
     }
+    /**
+     * Updates a property (startAddress or size) of a memory region.
+     * @param {string} name The name of the region to update.
+     * @param {string} key The property to update ('startAddress' or 'size').
+     * @param {string} value The new value (as a string, will be parsed).
+     */
     function updateRegion(name, key, value) {
         const region = state.memoryRegions[name];
         if (region) {
@@ -399,6 +481,11 @@ document.addEventListener('DOMContentLoaded', () => {
             recalculateLayout();
         }
     }
+    /**
+     * Clears the current state and loads a predefined partition template.
+     * Automatically adds the 'external_flash' region if the template requires it.
+     * @param {string} templateName The key of the template to load from the `templates` object.
+     */
     function loadTemplate(templateName) {
         state.items = [];
         state.nextId = 0;
@@ -416,6 +503,11 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         recalculateLayout(); // Recalculate layout once after all template items are added.
     }
+    /**
+     * Changes the selected MCU. This clears and reloads the default memory regions
+     * for the new MCU, while preserving any custom-added regions.
+     * @param {string} mcuKey The key of the MCU from the `mcuDatabase`.
+     */
     function updateMcu(mcuKey) {
         state.selectedMcu = mcuKey;
         const customRegions = {};
@@ -428,6 +520,12 @@ document.addEventListener('DOMContentLoaded', () => {
         Object.keys(customRegions).forEach(name => { state.memoryRegions[name] = customRegions[name]; });
         recalculateLayout();
     }
+    /**
+     * Loads and reconstructs the application state from a parsed YAML object.
+     * This function handles the logic of converting the flat structure of pm_static.yml
+     * (where groups are defined by 'span') into the hierarchical state tree used by the tool.
+     * @param {Object} data The JavaScript object parsed from a pm_static.yml file.
+     */
     function loadFromParsedYaml(data) {
         state.items = [];
         state.nextId = 0;
@@ -488,6 +586,11 @@ document.addEventListener('DOMContentLoaded', () => {
         recalculateLayout({ alignSizes: false }); // On import, preserve exact sizes from file.
         alert('Successfully loaded partitions from pm_static.yml!');
     }
+    /**
+     * Handles the file upload event for a `pm_static.yml` file.
+     * Reads the file, parses it using js-yaml, and passes the data to `loadFromParsedYaml`.
+     * @param {Event} e The file input change event.
+     */
     function handleFileUpload(e) {
         const file = e.target.files[0];
         if (!file) return;
@@ -500,12 +603,20 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --- Rendering Functions ---
+    /**
+     * A master function that calls all other render functions to update the entire UI.
+     * This should be called after any state change that affects the display.
+     */
     function renderAll() {
         renderMemoryRegionsList();
         renderPartitionList();
         renderGraphicalView();
         renderYaml();
     }
+    /**
+     * Renders the list of memory regions in the UI, including their name, start address, and size.
+     * Binds data attributes for event handling.
+     */
     function renderMemoryRegionsList() {
         memoryRegionsListEl.innerHTML = '';
         Object.keys(state.memoryRegions).forEach(name => {
@@ -523,6 +634,11 @@ document.addEventListener('DOMContentLoaded', () => {
             memoryRegionsListEl.appendChild(item);
         });
     }
+    /**
+     * Renders the hierarchical list of partitions and groups in the UI.
+     * It creates input fields for name, size, region, etc., and includes action buttons.
+     * It correctly handles rendering nested children within groups.
+     */
     function renderPartitionList() {
         partitionListEl.innerHTML = '';
         const regionOptions = Object.keys(state.memoryRegions).map(name => `<option value="${name}">${name}</option>`).join('');
@@ -579,6 +695,11 @@ document.addEventListener('DOMContentLoaded', () => {
         // Then, we only render the "root" items (those not contained within any group).
         state.items.filter(item => !allChildIds.has(item.id)).forEach(item => renderItem(item, false));
     }
+    /**
+     * Renders the visual block representation of the memory layout for each region.
+     * It displays partitions as colored blocks, showing their name, address range, and size.
+     * It also calculates and displays used, free, and overflow space for each region.
+     */
     function renderGraphicalView() {
         graphicalViewEl.innerHTML = '';
         Object.keys(state.memoryRegions).forEach(regionName => {
@@ -695,6 +816,11 @@ document.addEventListener('DOMContentLoaded', () => {
             graphicalViewEl.appendChild(regionEl);
         });
     }
+    /**
+     * Generates and renders the final `pm_static.yml` output in the text area.
+     * It flattens the hierarchical state, sorts items correctly, and formats them
+     * according to YAML syntax, including the use of YAML anchors for `span`.
+     */
     function renderYaml() {
         let yamlString = '';
         const allUniqueItems = [];
@@ -785,6 +911,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --- 4. INITIALIZATION ---
+    /**
+     * Initializes the application.
+     * Populates UI selectors (MCUs, Templates), sets up all event listeners for user interaction
+     * (clicks, changes, drag-and-drop), and loads the default MCU and template.
+     */
     function init() {
         Object.keys(templates).forEach(key => {
             const option = document.createElement('option');
