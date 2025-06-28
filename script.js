@@ -618,21 +618,22 @@ document.addEventListener('DOMContentLoaded', () => {
      * Binds data attributes for event handling.
      */
     function renderMemoryRegionsList() {
-        memoryRegionsListEl.innerHTML = '';
+        const fragment = document.createDocumentFragment();
         Object.keys(state.memoryRegions).forEach(name => {
             const region = state.memoryRegions[name];
             const item = document.createElement('div');
             item.className = 'region-item';
             item.innerHTML = `
-            <input type="text" value="${name}" data-name="${name}" data-key="name" title="Region Name" readonly class="item-name">
-            <input type="text" value="${formatHex(region.startAddress)}" data-name="${name}" data-key="startAddress" title="Start Address" class="region-input">
-            <input type="text" value="${formatHex(region.size)}" data-name="${name}" data-key="size" title="Size" class="region-input">
-            <div class="item-actions">
-            <button data-name="${name}" class="remove-region-btn action-btn" style="visibility: ${region.isDefault ? 'hidden' : 'visible'}">X</button>
-            </div>
+                <input type="text" value="${name}" data-name="${name}" data-key="name" title="Region Name" readonly class="item-name">
+                <input type="text" value="${formatHex(region.startAddress)}" data-name="${name}" data-key="startAddress" title="Start Address" class="region-input">
+                <input type="text" value="${formatHex(region.size)}" data-name="${name}" data-key="size" title="Size" class="region-input">
+                <div class="item-actions">
+                    <button data-name="${name}" class="remove-region-btn action-btn" style="visibility: ${region.isDefault ? 'hidden' : 'visible'}">X</button>
+                </div>
             `;
-            memoryRegionsListEl.appendChild(item);
+            fragment.appendChild(item);
         });
+        memoryRegionsListEl.replaceChildren(fragment);
     }
     /**
      * Renders the hierarchical list of partitions and groups in the UI.
@@ -640,8 +641,9 @@ document.addEventListener('DOMContentLoaded', () => {
      * It correctly handles rendering nested children within groups.
      */
     function renderPartitionList() {
-        partitionListEl.innerHTML = '';
+        const fragment = document.createDocumentFragment();
         const regionOptions = Object.keys(state.memoryRegions).map(name => `<option value="${name}">${name}</option>`).join('');
+
         function renderItem(item, isChild) {
             const isGroup = item.type === 'group';
             const isPad = item.name === 'mcuboot_pad';
@@ -661,21 +663,21 @@ document.addEventListener('DOMContentLoaded', () => {
                 : '';
 
             container.innerHTML = `
-            <div class="drag-handle" draggable="true">☰</div>
-            <div class="item-name-wrapper">
-                <input type="text" value="${item.name || ''}" data-id="${item.id}" data-key="name" placeholder="Name" class="item-input item-name">
-                ${errorIcon}
-            </div>
-            ${sizeInput}
-            ${regionSelector}
-            ${deviceInput}
-            ${spanInput}
-            <div class="item-actions">
-            ${isGroup ? `<button class="action-btn add-child-btn" data-id="${item.id}" title="Add Partition to Group">+</button>` : ''}
-            <button class="action-btn remove-item-btn" data-id="${item.id}" title="Remove Item">X</button>
-            </div>
+                <div class="drag-handle" draggable="true">☰</div>
+                <div class="item-name-wrapper">
+                    <input type="text" value="${item.name || ''}" data-id="${item.id}" data-key="name" placeholder="Name" class="item-input item-name">
+                    ${errorIcon}
+                </div>
+                ${sizeInput}
+                ${regionSelector}
+                ${deviceInput}
+                ${spanInput}
+                <div class="item-actions">
+                    ${isGroup ? `<button class="action-btn add-child-btn" data-id="${item.id}" title="Add Partition to Group">+</button>` : ''}
+                    <button class="action-btn remove-item-btn" data-id="${item.id}" title="Remove Item">X</button>
+                </div>
             `;
-            partitionListEl.appendChild(container);
+            fragment.appendChild(container);
             if (!isChild) {
                 const regionSelect = container.querySelector(`select[data-key="region"]`);
                 if (regionSelect) regionSelect.value = item.region;
@@ -694,6 +696,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Then, we only render the "root" items (those not contained within any group).
         state.items.filter(item => !allChildIds.has(item.id)).forEach(item => renderItem(item, false));
+        partitionListEl.replaceChildren(fragment);
     }
     /**
      * Renders the visual block representation of the memory layout for each region.
@@ -701,7 +704,7 @@ document.addEventListener('DOMContentLoaded', () => {
      * It also calculates and displays used, free, and overflow space for each region.
      */
     function renderGraphicalView() {
-        graphicalViewEl.innerHTML = '';
+        const fragment = document.createDocumentFragment();
         Object.keys(state.memoryRegions).forEach(regionName => {
             const region = state.memoryRegions[regionName];
             if (!region) return;
@@ -813,8 +816,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             regionEl.appendChild(layoutContainer);
-            graphicalViewEl.appendChild(regionEl);
+            fragment.appendChild(regionEl);
         });
+        graphicalViewEl.replaceChildren(fragment);
     }
     /**
      * Generates and renders the final `pm_static.yml` output in the text area.
